@@ -1,12 +1,14 @@
 const express = require("express"); //importing express module
 const path = require("path");
 const { open } = require("sqlite");
-const sqlite3 = require("sqlite3");
+const sqlite3 = require("sqlite3").verbose();
+const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
 
 const app = express(); //creating app instance
 app.use(express.json()); // for parsing application/json
 
-const dbPath = path.join(__dirname, "businessquant.db");
+const dbPath = path.join(__dirname, "epimax.db");
 
 let db = null;
 
@@ -29,75 +31,179 @@ const initializeDBAndServer = async () => {
 
 initializeDBAndServer();
 
-//API 1
-app.get("/Api1", async (request, response) => {
-  const { ticker } = request.query;
-  const getDataQuery = `SELECT *
-        FROM 
-          sampleData
-        WHERE 
-          ticker = "${ticker}"`;
+//middleware
+const authenticateToken = (request, response, next) => {
+  let jwtToken;
+  const authHeader = request.headers["authorization"];
+  if (authHeader !== undefined) {
+    jwtToken = authHeader.split(" ")[1];
+  }
+  if (jwtToken === undefined) {
+    response.status(401);
+    response.send("Invalid JWT Token");
+  } else {
+    jwt.verify(jwtToken, "MY_SECRET_TOKEN", async (error, payload) => {
+      if (error) {
+        response.status(401);
+        response.send("Invalid JWT Token");
+      } else {
+        request.userId = payload.userId;
+        next();
+      }
+    });
+  }
+};
 
-  const details = await db.all(getDataQuery);
-  response.send(details);
+// Sign Up API
+app.post("/signup/", async (request, response) => {
+  const { username, password } = request.body;
+  const hashedPassword = await bcrypt.hash(request.body.password, 10);
+  const selectUserQuery = `SELECT * FROM users WHERE username = '${username}'`;
+  const dbUser = await db.get(selectUserQuery);
+  if (dbUser === undefined) {
+    const createUserQuery = `
+        INSERT INTO
+          users (username, password_hash)
+        VALUES
+          (
+            '${username}',
+            '${hashedPassword}'
+          );`;
+    const dbResponse = await db.run(createUserQuery);
+    const newUserId = dbResponse.lastID;
+    response.status(201);
+    response.send(`Created new user with userid ${newUserId}`);
+  } else {
+    response.status(400);
+    response.send("User already exists");
+  }
 });
 
-//API 2
-app.get("/Api2", async (request, response) => {
-  const { ticker, column } = request.query;
-  // console.log(column)
-  const getDataQuery = `SELECT 
-        ticker, ${column}
-        FROM 
-          sampleData
-        WHERE 
-          ticker = "${ticker}" `;
+//login API
+app.post("/login/", async (request, response) => {
+  const { username, password } = request.body;
+  const userDetailsQuery = `
+    SELECT
+      *
+     FROM
+      users
+     WHERE
+      username = "${username}" ;`;
 
-  const details = await db.all(getDataQuery);
-  response.send(details);
+  const dbUser = await db.get(userDetailsQuery);
+  // console.log(dbUser.id);
+
+  if (dbUser === undefined) {
+    response.status(400);
+    response.send("Invalid user");
+  } else {
+    const isPasswordMatched = await bcrypt.compare(
+      password,
+      dbUser.password_hash
+    );
+    if (isPasswordMatched === true) {
+      const payload = {
+        username: username,
+        userId: dbUser.id,
+      };
+      const jwtToken = jwt.sign(payload, "MY_SECRET_TOKEN");
+      response.send({ jwtToken });
+    } else {
+      response.status(400);
+      response.send("Invalid password");
+    }
+  }
 });
 
-//API 3
-app.get("/Api3", async (request, response) => {
-  const { ticker, column, period } = request.query;
-  const year = period[0];
-  // console.log(column)
-  const getDataQuery = `SELECT 
-        ${column}
-        FROM 
-          sampleData
-        WHERE 
-          ticker = "${ticker}" AND  CAST((substr(date, 7, 4) || "-" || substr(date, 1, 2) || "-" || substr(date, 4, 2)) AS TEXT) >=  DATE('now','-${year} years')`;
+//API ENDPOINT 1
+app.post("/tasks", authenticateToken, async (request, response) => {
+  const { userId } = request;
+  const { title, description, status } = request.body;
+  const moment = require("moment");
+  const currentTime = moment().format("YYYY-MM-DD HH:mm:ss");
 
-  const details = await db.all(getDataQuery);
-  response.send(details);
+  const createNewTaskQuery = `
+        INSERT INTO
+            tasks (title, description, status, assignee_id, created_at)
+        VALUES ("${title}", "${description}", "${status}", ${userId}, "${currentTime}");
+                   `;
+  await db.run(createNewTaskQuery);
+  response.status(201);
+  response.send("Successfully created new task");
 });
 
-//API 4
-app.get("/Api4", async (request, response) => {
-  const { ticker, column, period } = request.query;
-  // console.log(column)
-  const year = period[0];
-  const getDataQuery = `SELECT 
-        ${column}
-        FROM 
-          sampleData 
-        WHERE 
-          ticker = "${ticker}" AND  CAST((substr(date, 7, 4) || "-" || substr(date, 1, 2) || "-" || substr(date, 4, 2)) AS TEXT) >=  DATE('now','-${year} years')`;
-
-  const details = await db.all(getDataQuery);
-  response.send(details);
+//API ENDPOINT 2
+app.get("/tasks", authenticateToken, async (request, response) => {
+  const { userId } = request;
+  // console.log(userId);
+  const allTasksQuery = `
+  SELECT
+    *
+  FROM
+    tasks
+  WHERE
+    assignee_id = ${userId};
+    `;
+  const dbResponse = await db.all(allTasksQuery);
+  response.status(200);
+  response.send(dbResponse);
 });
 
-//API 5
-app.get("/getData", async (request, response) => {
-  const { period } = request.query;
+//API ENDPOINT 3
+app.get("/tasks/:id", authenticateToken, async (request, response) => {
+  //get specified task by ID
+  const { userId } = request;
+  const { id } = request.params;
+  const specificTaskQuery = `
+  SELECT
+    *
+  FROM
+    tasks
+  WHERE
+    assignee_id = ${userId} and id = ${id};
+    `;
+  const dbResponse = await db.get(specificTaskQuery);
+  response.status(200);
+  response.send(dbResponse);
+});
 
-  const getDataQuery = `SELECT *
-  FROM sampleData`;
+//API ENDPOINT 4
+app.put("/tasks/:id", authenticateToken, async (request, response) => {
+  // update task by ID
+  const { userId } = request;
+  const { id } = request.params;
+  const { updatedTitle, updatedDescription, updatedStatus } = request.body;
+  const moment = require("moment");
+  const currentTime = moment().format("YYYY-MM-DD HH:mm:ss");
 
-  const details = await db.all(getDataQuery);
-  response.send(details);
+  const updateTaskQuery = `UPDATE
+        tasks
+    SET
+        title = '${updatedTitle}',
+        description = '${updatedDescription}',
+        status = '${updatedStatus}',
+        updated_at = '${currentTime}'
+    WHERE
+      assignee_id = ${userId} and id = ${id}; `;
+  await db.run(updateTaskQuery);
+  response.status(201);
+  response.send("Task Updated Successfully");
+});
+
+//API ENDPOINT 5
+app.delete("/tasks/:id", authenticateToken, async (request, response) => {
+  //delete task by ID
+  const { userId } = request;
+  const { id } = request.params;
+  const deleteSpecificTaskQuery = `
+  DELETE FROM
+    tasks
+  WHERE
+  assignee_id = ${userId} and id = ${id};
+  `;
+  await db.run(deleteSpecificTaskQuery);
+  response.status(200);
+  response.send("Task Deleted Successfully");
 });
 
 module.exports = app;
